@@ -1,0 +1,358 @@
+---
+title: "PML - Course Project"
+author: "Florian Dollak"
+date: "07 Februar 2018"
+output: html_document
+---
+
+```{r setup, include=FALSE, echo=FALSE}
+knitr::opts_chunk$set(echo = FALSE, message = FALSE, warning = FALSE)
+```
+
+```{r}
+## load required libraries
+
+library(tidyverse)
+library(caret)
+library(corrplot)
+library(lubridate)
+library(rattle)
+
+## set a general random seed for reproducability
+
+set.seed(19928)
+
+## read the data
+
+pml_training <-read_csv("pml-training.csv")
+pml_test <- read_csv("pml-testing.csv")
+
+```
+
+## Introduction
+
+This project concludes the "Practical Machine Learning" - class in the Coursera Data Science specialization. Fitness tracker data is used to predict the manner people do their weight lifting exercises. The goal is to use data from accelerometers on the belt, forearm, arm, and dumbell of 6 participants and predict 'how well they did their exercises', which is represented as the classe variable in the training data set.
+
+### The Data
+
+The training data for this project are available here:
+
+https://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.csv
+
+The test data are available here:
+
+https://d396qusza40orc.cloudfront.net/predmachlearn/pml-testing.csv
+
+The data for this project is based on this source: http://groupware.les.inf.puc-rio.br/har.
+
+## Data Preparation
+
+After loading the data, the first step was to transfer all character variables into factors and all integer variables into numeric format for easier processing later. 
+
+```{r cache=TRUE}
+# transform the timestamp to POSIXct
+
+pml_training$cvtd_timestamp <- as.POSIXct(pml_training$cvtd_timestamp, format = "%d/%m/%Y %H:%M")
+pml_test$cvtd_timestamp <- as.POSIXct(pml_test$cvtd_timestamp, format = "%d/%m/%Y %H:%M")
+
+# transform all character fields to factors
+
+pml_training[, sapply(pml_training, class) == 'character'] <-
+  lapply(pml_training[, sapply(pml_training, class) == 'character'], as.factor)
+
+pml_test[, sapply(pml_test, class) == 'character'] <-
+   lapply(pml_test[, sapply(pml_test, class) == 'character'], as.factor)
+
+# transform all integers fields to numeric
+
+pml_training[, sapply(pml_training, class) == 'integer'] <-
+  lapply(pml_training[, sapply(pml_training, class) == 'integer'], as.numeric)
+
+pml_test[, sapply(pml_test, class) == 'integer'] <-
+   lapply(pml_test[, sapply(pml_test, class) == 'integer'], as.numeric)
+```
+
+#### Create a validation dataset for later model testing
+
+To be on the safe side, I created a validation dataset to test some modeling parameters before application to the test set.
+
+```{r}
+
+# Create Validation data set
+
+valid_split <- createDataPartition(y = pml_training$classe, p = 0.7, list = FALSE)
+train_dat <- pml_training[valid_split, ]
+valid_dat <- pml_training[-valid_split, ]
+
+```
+
+#### Remove low or no-variance covariates
+
+Next step was to check which variables in the training set are viable for model building. To achieve this, the variability of the individual columns was checked, to see which variables contain only a single value or show very low variability and therefore add nothing in terms of prediction value. Those variables were excluded from the analysis. E.g.:
+
+```{r cache=TRUE}
+# check for predictors with no or near zero variance and exclude them from the data
+
+n0v <- nearZeroVar(train_dat[, -160], saveMetrics = T)
+
+head(n0v[n0v$nzv == T,])
+
+train_clean <- train_dat[,!(colnames(train_dat) %in% rownames(n0v[n0v$nzv == T,]))]
+```
+
+#### Remove NA columns
+
+Additionally, columns with more than 1% of missing values were also excluded (the other columns with NAs are later imputed as necessary)
+
+```{r cache=TRUE}
+# next we check for columns with many missing values
+  
+nalist <-
+  gather(as.tibble(lapply(train_clean, function(x)
+    (
+      sum(is.na(x)) / nrow(train_clean)
+    ) * 100)))
+
+# we remove columns with more than 1% of missing values (most have 90+% NA)
+
+train_clean <- train_clean[, colnames(train_clean) %in%  nalist[nalist$value < 1,]$key]
+
+```
+
+#### Remove redundant or low predictive covariates
+
+And finally, the index variable X1 was removed since it hints at no specific order and the timestamps in various formats have also mostly been excluded due to redundancy.
+
+```{r}
+
+# also the further columns are removed based on their expected usefulness
+
+train_clean[,c("X1", "raw_timestamp_part_1", "raw_timestamp_part_2")] <- NULL
+
+```
+
+#### Make the time dimension meaningful, hopefully
+
+The daytime was transformed into a factor variable to check whether the time of day has an effect on classe. It is possible that people are less concentrated after lunch for example.
+For the sake of this example I assume all test subjects to be in the same timezone.
+
+
+```{r}
+
+# Extract the hour component from the data
+
+train_clean$cvtd_timestamp <- factor(hour(train_clean$cvtd_timestamp))
+
+pml_test$cvtd_timestamp <- factor(hour(pml_test$cvtd_timestamp))
+
+valid_dat$cvtd_timestamp <- factor(hour(valid_dat$cvtd_timestamp))
+
+```
+
+```{r echo=TRUE}
+levels(train_clean$cvtd_timestamp)
+```
+
+
+## Model Selection
+
+#### Exploratory Plots
+
+Now, lets plot some graphs and check distributions, normality, variance etc. of our variables and check whether to preprocess and how much. Here a little preview:
+
+```{r}
+
+# Create plots to check the distributions of the data
+
+op <- par(mfrow = c(2, 4))
+
+for (i in names(train_clean[, sapply(train_clean, class) == 'numeric'])[1:4]) {
+        tmp <- train_clean[[i]]
+        qqnorm(tmp, main = i)
+        qqline(tmp)
+        hist(tmp, main = i)
+}
+
+par(op)
+rm(i, tmp)
+
+```
+
+Apparently some variables have some fancy distributions. Let's also check how well they correlate with each other:
+
+```{r fig.height=6, fig.cap='Correlation Matrix'}
+
+# check for correlated predictors
+
+cordat <- cor(train_clean[, 3:55], use = "complete.obs")
+corrplot(cordat, type="upper", insig = "blank", tl.cex = 0.5, method = "square")
+
+```
+
+It seems that similar activites/measurement modes are correlating with each other. This will be important later to consider, when choosing preprocessing functions (PCA! might be useful here).
+
+#### Preprocessing
+
+In terms of preprocessing as a default I decided to use a BoxCox transformation to push some of the variables closer to a normal distribution (see exploratory plots, some of the distributions were multimodal or skewed) and add knn-imputation as well in order to keep the  variables with < 1% of missing values.
+
+Due to some correlations I also checked PCA and found that 27 principal components explain around 95% of the variance. I decided I will run all my models both with and without pca and compare the results.
+
+```{r include=FALSE}
+# principal component check
+
+pca.comp <- prcomp(na.omit(train_clean[,3:55]), center = T, scale. = T)
+
+summary(pca.comp)
+
+```
+
+#### Cross Validation
+
+The cross validation method used in this case it a k-folds cross validation with 5x2 folds. The reasons for this are that k-folds seems less computational expensive compared to other cv-methods and the 5x2 model seems a good "middle-ground-model" in terms of variance/bias and computational load.
+
+```{r}
+# set trainingcontrols for the models
+
+train_control <- trainControl(method="repeatedcv", number=2, repeats = 5)
+
+```
+
+#### Train some models
+
+In terms of selecting an appropiate algorithm it was a little bit 'hit or miss'. I decidecd to use a diverse set of algorithms and check/compare the performance of each and finally select the best one for the test set.
+
+As mentioned before, I used PCA on all the selected models tp check whether there is an positive effect on the model performance or not . So basically every model was run twice. Once with PCA and once without.
+
+```{r cache=TRUE}
+# run without PCA
+
+train_rpart <-
+  train(
+  classe ~ .,
+  data = train_clean,
+  method = "rpart",
+  trControl = train_control,
+  preProcess = c("knnImpute", "BoxCox"),
+  na.action = na.pass,
+  tuneLength = 1
+  )
+  
+  train_rf <-
+  train(
+  classe ~ .,
+  data = train_clean ,
+  method = "rf",
+  trControl = train_control,
+  preProcess = c("knnImpute", "BoxCox"),
+  na.action = na.pass,
+  tuneLength = 1
+  )
+  
+  train_gbm <-
+  train(
+  classe ~ .,
+  data = train_clean,
+  method = "gbm",
+  trControl = train_control,
+  preProcess = c("knnImpute", "BoxCox"),
+  na.action = na.pass,
+  verbose = FALSE,
+  tuneLength = 1
+  )
+  
+  # run with PCA
+  
+  train_rpart_pca <-
+  train(
+  classe ~ .,
+  data = train_clean,
+  method = "rpart",
+  trControl = train_control,
+  preProcess = c("knnImpute", "BoxCox", "pca"),
+  na.action = na.pass,
+  tuneLength = 1
+  )
+  
+  train_rf_pca <-
+  train(
+  classe ~ .,
+  data = train_clean,
+  method = "rf",
+  trControl = train_control,
+  preProcess = c("knnImpute", "BoxCox", "pca"),
+  na.action = na.pass,
+  tuneLength = 1
+  )
+  
+  train_gbm_pca <-
+  train(
+  classe ~ .,
+  data = train_clean,
+  method = "gbm",
+  trControl = train_control,
+  preProcess = c("knnImpute", "BoxCox", "pca"),
+  na.action = na.pass,
+  verbose = FALSE,
+  tuneLength = 1
+  )
+```
+
+#### Compare Models
+
+```{r}
+
+# compare the different models
+
+results <-
+  resamples(
+  list(
+  rpart = train_rpart,
+  rf = train_rf,
+  gbm = train_gbm,
+  rpart_pca = train_rpart_pca,
+  rf_pca = train_rf_pca,
+  gbm_pca = train_gbm_pca
+  )
+  )
+
+# summarize the distributions
+modcomp_sum <- summary(results)
+
+# boxplots of results
+dotplot(results)
+
+```
+
+The results show that the random forest model achieved the highest accuracy among the chosen models. PCA preprocessing seems to have a negative effect in this case. Therefore the random forest model is chosen and applied to the validation data set and check the results.
+
+#### Out of Sample Error
+
+Now I used the validation data set to predict and estimate the out-of-sample error.
+
+```{r}
+
+# predict on the validation dataset
+
+valid_pred <- predict(train_rf, valid_dat[, colnames(train_clean[,-56])])
+  
+conmat <- confusionMatrix(valid_pred, valid_dat[complete.cases(valid_dat[, colnames(train_clean[,-56])]),]$classe)
+
+outOfSampleError <- (1 - conmat$overall[1])*100
+names(outOfSampleError) <- "OutofSample - Error[%]"
+
+```
+
+The out of sample error for the validation data set is: 
+```{r}
+outOfSampleError
+```
+
+#### Apply the chosen model to the test data
+
+And finally the chosen random forest model is applied to the test data set:
+
+```{r}
+final_pred <- predict(train_rf, pml_test)
+data.frame(pml_test,final_pred)[,160:161]
+```
+
